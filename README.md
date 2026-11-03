@@ -1,6 +1,6 @@
 # Between the Lines
 
-A private-first WhatsApp chat report MVP. It reads WhatsApp `.txt` exports and `.zip` archives (extracting the chat text locally in the browser), lets the user identify themselves and choose a report voice, then asks a configured OpenAI-compatible model for an evidence-led conversation read.
+A private-first WhatsApp chat report MVP. It reads WhatsApp `.txt` exports and `.zip` archives (extracting the chat text locally in the browser), lets the user identify themselves and choose a report voice, then asks Google Gemini for an evidence-led conversation read.
 
 ## Run locally
 
@@ -11,15 +11,17 @@ A private-first WhatsApp chat report MVP. It reads WhatsApp `.txt` exports and `
 
 ## Model settings
 
-The server calls a chat-completions-compatible endpoint. Keep these values in `.env.local`; do not add API keys to client code or commit them.
+The server calls Gemini through Google's official SDK (`@google/genai`), using `gemini-3.5-flash-lite` unless `MODEL_NAME` names another Gemini model. Keep these values in `.env.local`; do not add API keys to client code or commit them.
 
 ```dotenv
-MODEL_API_URL=https://your-provider.example/v1/chat/completions
-MODEL_API_KEY=your-secret-key
-MODEL_NAME=your-model-id
+GEMINI_API_KEY=your-secret-key
+# Optional; defaults to gemini-3.5-flash-lite
+MODEL_NAME=
 ```
 
-The app does not need the model key until the user requests an analysis. The report pipeline normalizes messages and deterministic metrics, then runs evidence analysis, narrative synthesis, report writing, and an independent safety/quality review. It samples up to 180 evenly spaced messages, limits the model context, and redacts email addresses, phone numbers, payment-card-like numbers, US Social Security number patterns, and common street-address forms before sending text. A single writer repair pass is attempted when the reviewer requests revisions.
+**Do not use a free-tier Gemini key with real conversations.** Google's terms for unpaid services allow it to use submitted content to improve its products, allow human reviewers to read it, and say not to submit sensitive, confidential, or personal information. They also require paid services when the app is offered to users in the EEA, Switzerland, or the UK. Redaction here removes contact details and similar patterns, not names or message text. Use synthetic chats on the free tier, and a billing-enabled key for real ones. The consent text in `app/page.tsx` describes the free-tier terms, so update it when moving to a paid key.
+
+The app does not need the model key until the user requests an analysis. The report pipeline normalizes messages and deterministic metrics, then runs evidence analysis, narrative synthesis, report writing, and an independent safety/quality review. It samples up to 180 evenly spaced messages, limits the model context, and redacts email addresses, phone numbers, payment-card-like numbers, US Social Security number patterns, and common street-address forms before sending text. The report is written in two halves, each checked for its sections and retried once if malformed. A single writer repair pass is attempted when the exact-quote check fails or the reviewer requests revisions.
 
 The selected model provider processes the redacted sample under its own data-handling terms. The original upload and full parsed chat are not sent to storage. The sampled, redacted messages and intermediate workflow results are persisted by Vercel Workflows while a job runs; on Hobby, workflow state is retained for up to one day. Completed reports are stored in private Vercel Blob when connected, otherwise in this browser’s local storage during local development. Blob reports remain until deleted; browser-local reports stay on that device. `ReportStorage` keeps browser history replaceable; a 256-bit device capability scopes private Blob access, but it is not account authentication or recovery.
 
@@ -40,7 +42,7 @@ The HTTP route only starts or checks a job. Each model request runs in a separat
 1. Push this repository to GitHub. `.env.local`, other `.env.*` files, build output, and dependencies are excluded from Git; only `.env.example` is tracked.
 2. Import the GitHub repository in Vercel and keep the detected Next.js build settings (`npm run build`).
 3. In Vercel Storage, create and connect a **private** Blob store to the project. Enable access to Vercel system environment variables so the SDK can use the store’s `BLOB_STORE_ID` and Vercel OIDC. Do not make reports public.
-4. Add `MODEL_API_URL`, `MODEL_API_KEY`, and `MODEL_NAME` as server-side environment variables in Vercel Project Settings. Add them to Preview and Production only when those environments should make real model requests. Never use a `NEXT_PUBLIC_` prefix for these secrets.
+4. Add `GEMINI_API_KEY` (and optionally `MODEL_NAME`) as server-side environment variables in Vercel Project Settings. Add them to Preview and Production only when those environments should make real model requests. Never use a `NEXT_PUBLIC_` prefix for these secrets.
 5. Deploy a Preview first and verify it with a synthetic chat before sending any real conversation.
 
 GitHub Actions runs `npm ci`, the test suite, and a production build on pushes and pull requests using Node.js 22.

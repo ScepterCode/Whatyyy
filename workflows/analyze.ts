@@ -1,3 +1,10 @@
+import {
+  ApiError,
+  FinishReason,
+  GoogleGenAI,
+  ThinkingLevel,
+  type GenerateContentResponse,
+} from "@google/genai";
 import { put } from "@vercel/blob";
 import { FatalError } from "workflow";
 import {
@@ -5,9 +12,12 @@ import {
   narrativeSystemPrompt,
   PROMPT_VERSION,
   QUALITY_REVIEW_PROMPT,
+  WRITER_PART_SECTION_IDS,
   writerSystemPrompt,
 } from "../lib/pipeline-prompts";
 import {
+  checkReportPart,
+  mergeReportParts,
   parseAnalystOutput,
   parseChatReport,
   parseJsonObject,
@@ -60,6 +70,14 @@ type AnalysisWorkflowResult = {
 };
 
 const MODEL_CALL_TIMEOUT_MS = 55_000;
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const BLOCKED_FINISH_REASONS = new Set<FinishReason>([
+  FinishReason.SAFETY,
+  FinishReason.RECITATION,
+  FinishReason.BLOCKLIST,
+  FinishReason.PROHIBITED_CONTENT,
+  FinishReason.SPII,
+]);
 
 function hasBlobConfiguration(): boolean {
   return Boolean(process.env.BLOB_STORE_ID || process.env.BLOB_READ_WRITE_TOKEN);
@@ -127,125 +145,103 @@ function filterNarrativeEvidence(
   return narrative;
 }
 
-function getResponseContent(result: unknown): string | null {
-  if (!result || typeof result !== "object") return null;
-  const choices = (result as { choices?: unknown }).choices;
-  if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== "object") return null;
-  const message = (choices[0] as { message?: unknown }).message;
-  if (!message || typeof message !== "object") return null;
-  const content = (message as { content?: unknown }).content;
-  return typeof content === "string" ? content : null;
-}
-
-function isSecureModelUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      !url.username &&
-      !url.password &&
-      (url.protocol === "https:" ||
-        (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))
-    );
-  } catch {
-    return false;
-  }
-}
+type ModelReply = {
+  content: string;
+  // True when the model stopped because it hit max_tokens, so the reply is cut off.
+  truncated: boolean;
+};
 
 async function requestModelStep(
   systemPrompt: string,
   userData: unknown,
   maxTokens: number,
-): Promise<string> {
+): Promise<ModelReply> {
   "use step";
 
-  const apiUrl = process.env.MODEL_API_URL;
-  const apiKey = process.env.MODEL_API_KEY;
-  const model = process.env.MODEL_NAME;
-  if (!apiUrl || !apiKey || !model || !isSecureModelUrl(apiUrl)) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
     throw new FatalError("Model access is not configured correctly. Check the server model settings.");
   }
+  // No retryOptions: callStructuredModel owns retries, and SDK retries would overrun the step timeout.
+  const client = new GoogleGenAI({ apiKey, httpOptions: { timeout: MODEL_CALL_TIMEOUT_MS } });
 
-  let response: Response;
+  let response: GenerateContentResponse;
   try {
-    const nvidiaOptions =
-      new URL(apiUrl).hostname === "integrate.api.nvidia.com" ||
-      model.toLowerCase().startsWith("nvidia/")
-        ? {
-            chat_template_kwargs: { enable_thinking: true, low_effort: true },
-            reasoning_budget: 1_024,
-          }
-        : {};
-    response = await fetch(apiUrl, {
-      method: "POST",
-      redirect: "error",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+    response = await client.models.generateContent({
+      model: process.env.MODEL_NAME || DEFAULT_MODEL,
+      contents: JSON.stringify(userData),
+      config: {
+        systemInstruction: systemPrompt,
+        maxOutputTokens: maxTokens,
+        responseMimeType: "application/json",
+        // Thinking tokens count toward maxOutputTokens and add latency; each stage returns bounded JSON.
+        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
       },
-      signal: AbortSignal.timeout(MODEL_CALL_TIMEOUT_MS),
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        max_tokens: maxTokens,
-        ...nvidiaOptions,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: JSON.stringify(userData) },
-        ],
-      }),
     });
   } catch (error) {
-    if (error instanceof Error && error.name === "TimeoutError") {
+    if (error instanceof ApiError) {
+      // Gemini reports an invalid key as a 400, not a 401.
+      const keyRejected =
+        error.status === 401 || error.status === 403 || /API_KEY_INVALID|API key not valid/i.test(error.message);
+      throw new FatalError(
+        keyRejected
+          ? "The model rejected the API key. Check your model settings."
+          : `The model service returned an error (${error.status}). Try again in a moment.`,
+      );
+    }
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
       throw new FatalError("The model took too long to complete a pipeline stage. Try again.");
     }
     if (error instanceof TypeError) {
-      throw new FatalError("Could not reach the configured model service. Check its URL and try again.");
+      throw new FatalError("Could not reach the configured model service. Check your connection and try again.");
     }
     throw error;
   }
 
-  if (!response.ok) {
-    const status = response.status;
-    throw new FatalError(
-      status === 401 || status === 403
-        ? "The model rejected the API key. Check your model settings."
-        : `The model service returned an error (${status}). Try again in a moment.`,
-    );
+  const finishReason = response.candidates?.[0]?.finishReason;
+  if (response.promptFeedback?.blockReason || (finishReason && BLOCKED_FINISH_REASONS.has(finishReason))) {
+    throw new FatalError("The model declined to analyze this conversation.");
   }
-
-  let result: unknown;
-  try {
-    result = await response.json();
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      throw new FatalError("The model returned an unreadable response. Check the chat-completions endpoint.");
-    }
-    throw error;
-  }
-  const content = getResponseContent(result);
-  if (!content) throw new FatalError("The model service returned an empty response.");
-  return content;
+  const truncated = finishReason === FinishReason.MAX_TOKENS;
+  const content = response.text ?? "";
+  // A reply cut off during thinking can be empty; let the format retry handle it.
+  if (!content && !truncated) throw new FatalError("The model service returned an empty response.");
+  return { content, truncated };
 }
 
 async function callStructuredModel(
   systemPrompt: string,
   userData: unknown,
   maxTokens: number,
+  checkShape?: (value: Record<string, unknown>) => void,
 ): Promise<Record<string, unknown>> {
+  let formatProblem = "";
+  let wasTruncated = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const prompt =
       attempt === 0
         ? systemPrompt
-        : `${systemPrompt}\nYour previous response was not a complete JSON object. Return a complete object matching the requested schema, with no surrounding prose or markdown.`;
-    const content = await requestModelStep(prompt, userData, attempt === 0 ? maxTokens : Math.min(5_000, Math.ceil(maxTokens * 1.5)));
+        : wasTruncated
+          ? `${systemPrompt}\nYour previous response ran out of room before the JSON object was complete. Write more concisely so the complete object fits, with every requested field and section and no surrounding prose or markdown.`
+          : `${systemPrompt}\nYour previous response was not a complete JSON object matching the requested schema (${formatProblem}). Return a complete object with every requested field and section, with no surrounding prose or markdown.`;
+    // The retry gets more room, capped so one call still finishes within the step timeout.
+    const tokenLimit = attempt === 0 ? maxTokens : Math.min(6_000, Math.ceil(maxTokens * 1.5));
+    const { content, truncated } = await requestModelStep(prompt, userData, tokenLimit);
     try {
-      return parseJsonObject(content);
+      const value = parseJsonObject(content);
+      checkShape?.(value);
+      return value;
     } catch (error) {
       if (!(error instanceof ReportFormatError)) throw error;
       if (attempt === 1) {
-        throw new FatalError(`The model returned invalid JSON after one format retry (${error.message}). Try again.`);
+        throw new FatalError(
+          truncated
+            ? `The model ran out of room for its reply (${tokenLimit.toLocaleString("en-US")}-token limit) after one retry. Try again.`
+            : `The model returned invalid JSON after one format retry (${error.message}). Try again.`,
+        );
       }
+      formatProblem = error.message;
+      wasTruncated = truncated;
     }
   }
   throw new FatalError("The model did not return a complete JSON response.");
@@ -281,7 +277,9 @@ function applySafetyReview(report: ChatReport, review: SafetyReview, analysis: A
 
 function validateEvidence(report: ChatReport, input: AnalysisWorkflowInput): void {
   const issues = validateReportEvidence(report, input.sourceMessages, input.participants);
-  if (issues.length) throw new FatalError(issues.join(" "));
+  if (issues.length) {
+    throw new FatalError(`The report failed its evidence and safety checks after one repair pass. ${issues.join(" ")}`);
+  }
 }
 
 async function saveReportStep(
@@ -314,6 +312,54 @@ async function saveReportStep(
   return { storedReport, storedRemotely: true };
 }
 
+async function writeReport(
+  input: AnalysisWorkflowInput,
+  writerPayload: Record<string, unknown>,
+  repairInstructions = "",
+): Promise<ChatReport> {
+  // A repair rewrites against a larger payload (previous report and issues), so it gets more room.
+  const maxTokens = repairInstructions
+    ? input.settings.depth === "deep_dive" ? 6_000 : 5_000
+    : input.settings.depth === "deep_dive" ? 5_000 : 4_000;
+  const [openingIds, closingIds] = WRITER_PART_SECTION_IDS;
+  const opening = await callStructuredModel(
+    writerSystemPrompt(input.settings, 1, repairInstructions),
+    writerPayload,
+    maxTokens,
+    (value) => checkReportPart(value, openingIds, true),
+  );
+  const closing = await callStructuredModel(
+    writerSystemPrompt(input.settings, 2, repairInstructions),
+    { ...writerPayload, report_so_far: opening },
+    maxTokens,
+    (value) => checkReportPart(value, closingIds, false),
+  );
+  return parseChatReport(mergeReportParts(opening, closing, ...WRITER_PART_SECTION_IDS));
+}
+
+async function reviewReport(
+  input: AnalysisWorkflowInput,
+  report: ChatReport,
+  analysis: AnalystOutput,
+  narrative: NarrativeBrief,
+): Promise<SafetyReview> {
+  return parseSafetyReview(
+    await callStructuredModel(
+      QUALITY_REVIEW_PROMPT,
+      {
+        report,
+        analysis,
+        narrative,
+        source_messages: input.sourceMessages,
+        participants: input.participants,
+        settings: input.settings,
+      },
+      // Reviews list issues, scores, and repair instructions, which overran 1,200 tokens.
+      2_000,
+    ),
+  );
+}
+
 export async function analyzeConversation(
   input: AnalysisWorkflowInput,
 ): Promise<AnalysisWorkflowResult> {
@@ -334,7 +380,8 @@ export async function analyzeConversation(
       await callStructuredModel(
         analystSystemPrompt(input.settings),
         analystPayload,
-        2_000,
+        // The prompt bounds findings to about 20 short entries, which fits within this cap.
+        3_000,
       ),
       input.participants,
     ),
@@ -352,85 +399,55 @@ export async function analyzeConversation(
           participants: input.participants,
           selected_user: input.selectedUser,
         },
-        1_200,
+        1_800,
       ),
     ),
     input.sourceMessages,
   );
   if (hasHighRiskFlags(analysis)) narrative.safety_mode = true;
 
-  let report = parseChatReport(
-    await callStructuredModel(
-      writerSystemPrompt(input.settings),
-      {
-        analysis,
-        narrative,
-        participants: input.participants,
-        selected_user: input.selectedUser,
-        messages: input.sourceMessages,
-        prompt_version: PROMPT_VERSION,
-      },
-      input.settings.depth === "deep_dive" ? 3_600 : 2_600,
-    ),
-  );
-  validateEvidence(report, input);
+  const writerPayload = {
+    analysis,
+    narrative,
+    participants: input.participants,
+    selected_user: input.selectedUser,
+    messages: input.sourceMessages,
+    prompt_version: PROMPT_VERSION,
+  };
+  let report = await writeReport(input, writerPayload);
 
-  let review = parseSafetyReview(
-    await callStructuredModel(
-      QUALITY_REVIEW_PROMPT,
-      {
-        report,
-        analysis,
-        narrative,
-        source_messages: input.sourceMessages,
-        participants: input.participants,
-        settings: input.settings,
-      },
-      1_200,
-    ),
-  );
+  // A draft that fails the exact-quote check goes straight to the single repair pass;
+  // reviewing it first would only spend a model call on text that must be rewritten.
+  const evidenceIssues = validateReportEvidence(report, input.sourceMessages, input.participants);
+  let review = evidenceIssues.length ? null : await reviewReport(input, report, analysis, narrative);
 
-  if (review.decision !== "reject" && !isReviewApproved(review, analysis)) {
+  if (evidenceIssues.length || (review && review.decision !== "reject" && !isReviewApproved(review, analysis))) {
     const repairInstructions = [
-      ...review.repair_instructions,
+      ...(evidenceIssues.length
+        ? [
+            "The automatic checker rejected the previous draft. Rewrite every passage listed below instead of copying it from previous_report: if the quoted text is suggested wording, put the label Suggested script: immediately before its opening quotation mark; if it is chat text, copy it character-for-character from the cited message; otherwise remove the quotation marks. If a passage is flagged as potentially unsafe advice, reword it so the flagged word no longer appears anywhere in the report.",
+          ]
+        : []),
+      ...evidenceIssues,
+      ...(review?.repair_instructions ?? []),
       ...(hasHighRiskFlags(analysis)
         ? ["Include compassionate, safety-first framing and do not minimize any high-risk safety flag."]
         : []),
     ];
-    report = parseChatReport(
-      await callStructuredModel(
-        writerSystemPrompt(input.settings, repairInstructions.join("\n")),
-        {
-          analysis,
-          narrative,
-          participants: input.participants,
-          selected_user: input.selectedUser,
-          messages: input.sourceMessages,
-          previous_report: report,
-          review,
-          prompt_version: PROMPT_VERSION,
-        },
-        input.settings.depth === "deep_dive" ? 3_600 : 2_600,
-      ),
+    report = await writeReport(
+      input,
+      {
+        ...writerPayload,
+        previous_report: report,
+        ...(review ? { review } : { evidence_issues: evidenceIssues }),
+      },
+      repairInstructions.join("\n"),
     );
     validateEvidence(report, input);
-    review = parseSafetyReview(
-      await callStructuredModel(
-        QUALITY_REVIEW_PROMPT,
-        {
-          report,
-          analysis,
-          narrative,
-          source_messages: input.sourceMessages,
-          participants: input.participants,
-          settings: input.settings,
-        },
-        1_200,
-      ),
-    );
+    review = await reviewReport(input, report, analysis, narrative);
   }
 
-  if (!isReviewApproved(review, analysis)) {
+  if (!review || !isReviewApproved(review, analysis)) {
     throw new FatalError("The independent quality review did not approve this report.");
   }
   report = applySafetyReview(report, review, analysis);
