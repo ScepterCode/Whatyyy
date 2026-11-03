@@ -51,20 +51,39 @@ function analyzeRequest(consented = true): Request {
 }
 
 function configureModel() {
-  vi.stubEnv("MODEL_API_URL", "https://model.example/v1/chat/completions");
-  vi.stubEnv("MODEL_API_KEY", "test-key");
-  vi.stubEnv("MODEL_NAME", "test-model");
+  vi.stubEnv("GEMINI_API_KEY", "test-key");
+  vi.stubEnv("MODEL_NAME", "");
   vi.stubEnv("BLOB_STORE_ID", "");
   vi.stubEnv("BLOB_READ_WRITE_TOKEN", "");
   vi.stubEnv("VERCEL", "");
 }
 
-function modelResponse(content: unknown): Response {
+function modelResponse(content: unknown, finishReason = "STOP"): Response {
   return new Response(
-    JSON.stringify({ choices: [{ message: { content: JSON.stringify(content) } }] }),
+    JSON.stringify({
+      candidates: [
+        {
+          content: {
+            role: "model",
+            parts: [{ text: typeof content === "string" ? content : JSON.stringify(content) }],
+          },
+          finishReason,
+        },
+      ],
+    }),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
 }
+
+type ModelRequest = {
+  systemInstruction: { parts: Array<{ text: string }> };
+  contents: Array<{ parts: Array<{ text: string }> }>;
+  generationConfig: { maxOutputTokens: number };
+};
+
+const systemOf = (request: unknown) => (request as ModelRequest).systemInstruction.parts[0].text;
+const userOf = (request: unknown) => (request as ModelRequest).contents[0].parts[0].text;
+const maxTokensOf = (request: unknown) => (request as ModelRequest).generationConfig.maxOutputTokens;
 
 function reportPayload() {
   return {
@@ -91,6 +110,13 @@ function reportPayload() {
   };
 }
 
+function reportParts(report: ReturnType<typeof reportPayload> = reportPayload()): unknown[] {
+  return [
+    { ...report, sections: report.sections.slice(0, 8) },
+    { sections: report.sections.slice(8) },
+  ];
+}
+
 function validPipelineResponses(): unknown[] {
   return [
     {
@@ -114,7 +140,7 @@ function validPipelineResponses(): unknown[] {
       key_quotes: [],
       kind_next_moves: [],
     },
-    reportPayload(),
+    ...reportParts(),
     {
       decision: "pass",
       issues: [],
@@ -182,14 +208,12 @@ afterEach(() => {
 
 describe("POST /api/analyze", () => {
   it("requires model credentials without queuing a fallback job", async () => {
-    vi.stubEnv("MODEL_API_URL", "");
-    vi.stubEnv("MODEL_API_KEY", "");
-    vi.stubEnv("MODEL_NAME", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
 
     const response = await POST(analyzeRequest());
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({
-      error: expect.stringContaining("MODEL_API_URL"),
+      error: expect.stringContaining("GEMINI_API_KEY"),
     });
     expect(start).not.toHaveBeenCalled();
   });
@@ -199,15 +223,6 @@ describe("POST /api/analyze", () => {
 
     const response = await POST(analyzeRequest(false));
     expect(response.status).toBe(400);
-    expect(start).not.toHaveBeenCalled();
-  });
-
-  it("rejects a non-HTTPS model endpoint outside localhost", async () => {
-    configureModel();
-    vi.stubEnv("MODEL_API_URL", "http://model.example/v1/chat/completions");
-
-    const response = await POST(analyzeRequest());
-    expect(response.status).toBe(500);
     expect(start).not.toHaveBeenCalled();
   });
 
@@ -289,31 +304,35 @@ describe("analyzeConversation workflow", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const result = await analyzeConversation(workflowInput());
-    const analystUser = JSON.stringify(
-      (requests[0].body.messages as Array<{ role: string; content: string }>)[1].content,
-    );
+    const analystUser = userOf(requests[0].body);
 
     expect(result.report.sections).toHaveLength(15);
     expect(result.report.sections.find((section) => section.id === "real_time_reading")?.quotes).toEqual([
       { message_id: 2, sender: "Sam", text: "We can talk tomorrow." },
     ]);
-    expect(requests).toHaveLength(4);
+    expect(requests).toHaveLength(5);
+    const writerSystem = (index: number) => systemOf(requests[index].body);
+    expect(writerSystem(2)).toContain('["cold_open","short_version"');
+    expect(writerSystem(2)).not.toContain('"what_you_are_doing_right","real_time_reading"');
+    expect(writerSystem(3)).toContain('["what_you_are_doing_right","real_time_reading"');
+    expect(
+      JSON.parse(userOf(requests[3].body)),
+    ).toMatchObject({ report_so_far: { title: reportPayload().title } });
     expect(analystUser).toContain("[phone]");
     expect(analystUser).toContain("[email]");
-    expect(requests.every((item) => item.headers.get("Authorization") === "Bearer test-key")).toBe(true);
-    expect(requests[0].body).not.toHaveProperty("chat_template_kwargs");
+    expect(requests.every((item) => item.headers.get("x-goog-api-key") === "test-key")).toBe(true);
     expect(result.storedRemotely).toBe(false);
   });
 
-  it("uses NVIDIA low-effort reasoning to keep its model calls within a function step", async () => {
+  it("calls the default Gemini model with minimal thinking and JSON output", async () => {
     configureModel();
-    vi.stubEnv("MODEL_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions");
-    vi.stubEnv("MODEL_NAME", "nvidia/test-model");
+    const urls: string[] = [];
     const requests: Array<Record<string, unknown>> = [];
     const responses = validPipelineResponses();
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      vi.fn(async (url: RequestInfo | URL, init?: RequestInit) => {
+        urls.push(String(url));
         requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         return modelResponse(responses.shift());
       }),
@@ -321,10 +340,58 @@ describe("analyzeConversation workflow", () => {
 
     await analyzeConversation(workflowInput());
 
+    expect(urls[0]).toContain("gemini-3.5-flash-lite");
     expect(requests[0]).toMatchObject({
-      chat_template_kwargs: { enable_thinking: true, low_effort: true },
-      reasoning_budget: 1_024,
+      generationConfig: {
+        maxOutputTokens: 3_000,
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingLevel: "MINIMAL" },
+      },
     });
+    expect(systemOf(requests[0])).toContain("You are the Analyst stage");
+  });
+
+  it("uses MODEL_NAME to choose another Gemini model", async () => {
+    configureModel();
+    vi.stubEnv("MODEL_NAME", "gemini-3.8-flash");
+    const urls: string[] = [];
+    const responses = validPipelineResponses();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: RequestInfo | URL) => {
+        urls.push(String(url));
+        return modelResponse(responses.shift());
+      }),
+    );
+
+    await analyzeConversation(workflowInput());
+
+    expect(urls.every((url) => url.includes("gemini-3.8-flash"))).toBe(true);
+  });
+
+  it("treats an invalid API key error as a rejected key", async () => {
+    configureModel();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ error: { code: 400, message: "API key not valid.", status: "INVALID_ARGUMENT" } }),
+            { status: 400, headers: { "Content-Type": "application/json" } },
+          ),
+      ),
+    );
+
+    await expect(analyzeConversation(workflowInput())).rejects.toThrow("The model rejected the API key.");
+  });
+
+  it("reports a refusal instead of treating it as a reply", async () => {
+    configureModel();
+    vi.stubGlobal("fetch", vi.fn(async () => modelResponse("", "SAFETY")));
+
+    await expect(analyzeConversation(workflowInput())).rejects.toThrow(
+      "The model declined to analyze this conversation.",
+    );
   });
 
   it("retries a malformed model response once with a formatting instruction", async () => {
@@ -336,13 +403,53 @@ describe("analyzeConversation workflow", () => {
     await expect(analyzeConversation(workflowInput())).resolves.toMatchObject({
       report: { sections: expect.any(Array) },
     });
-    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+  });
+
+  it("retries a writer half that leaves out one of its sections", async () => {
+    configureModel();
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = validPipelineResponses();
+    const [, closing] = reportParts() as Array<{ sections: Array<{ id: string }> }>;
+    responses.splice(3, 0, { sections: closing.sections.filter((section) => section.id !== "verdict") });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return modelResponse(responses.shift());
+      }),
+    );
+
+    await expect(analyzeConversation(workflowInput())).resolves.toMatchObject({
+      report: { sections: expect.any(Array) },
+    });
+    expect(requests).toHaveLength(6);
+    expect(maxTokensOf(requests[4])).toBe(6_000);
+    expect(systemOf(requests[4])).toContain("missing sections verdict");
+  });
+
+  it("reports a reply cut off at the token limit as running out of room", async () => {
+    configureModel();
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return modelResponse('{"participants":["Maya"', "MAX_TOKENS");
+      }),
+    );
+
+    await expect(analyzeConversation(workflowInput())).rejects.toThrow(
+      "The model ran out of room for its reply (4,500-token limit) after one retry.",
+    );
+    expect(requests).toHaveLength(2);
+    expect(systemOf(requests[1])).toContain("ran out of room before the JSON object was complete");
   });
 
   it("rejects an unapproved quality review", async () => {
     configureModel();
     const responses = validPipelineResponses();
-    responses[3] = {
+    responses[4] = {
       decision: "reject",
       issues: [],
       safety_assessment: {
@@ -364,7 +471,7 @@ describe("analyzeConversation workflow", () => {
   it("makes one repair pass when the independent reviewer requests revisions", async () => {
     configureModel();
     const responses = validPipelineResponses();
-    responses[3] = {
+    responses[4] = {
       decision: "revise",
       issues: [{ code: "generic_report", severity: "major", description: "Make the report more specific.", message_ids: [2] }],
       quality_scores: {},
@@ -377,7 +484,7 @@ describe("analyzeConversation workflow", () => {
       },
       repair_instructions: ["Make claims more specific to the cited evidence."],
     };
-    responses.push(reportPayload(), {
+    responses.push(...reportParts(), {
       decision: "pass",
       issues: [],
       quality_scores: {},
@@ -396,22 +503,56 @@ describe("analyzeConversation workflow", () => {
     await expect(analyzeConversation(workflowInput())).resolves.toMatchObject({
       report: { title: expect.any(String) },
     });
-    expect(fetchMock).toHaveBeenCalledTimes(6);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
   });
 
-  it("blocks reports containing unsupported quoted text", async () => {
+  it("blocks reports whose unsupported quoted text survives the repair pass", async () => {
     configureModel();
     const responses = validPipelineResponses();
     const invalidReport = reportPayload();
     invalidReport.sections.find((section) => section.id === "real_time_reading")!.quotes = [
       { message_id: 2, sender: "Sam", text: "We secretly moved to Paris." },
     ];
-    responses[2] = invalidReport;
+    responses.splice(2, 2, ...reportParts(invalidReport), ...reportParts(invalidReport));
     const fetchMock = vi.fn(async () => modelResponse(responses.shift()));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(analyzeConversation(workflowInput())).rejects.toThrow("unsupported quote");
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(analyzeConversation(workflowInput())).rejects.toThrow(
+      /evidence and safety checks after one repair pass.*unsupported quote/,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+  });
+
+  it("sends exact-quote failures through the repair pass before review", async () => {
+    configureModel();
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = validPipelineResponses();
+    const invalidReport = reportPayload();
+    invalidReport.sections.find((section) => section.id === "real_time_reading")!.quotes = [
+      { message_id: 2, sender: "Sam", text: "We secretly moved to Paris." },
+    ];
+    responses.splice(2, 0, ...reportParts(invalidReport));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return modelResponse(responses.shift());
+      }),
+    );
+
+    await expect(analyzeConversation(workflowInput())).resolves.toMatchObject({
+      report: { sections: expect.any(Array) },
+    });
+    expect(requests).toHaveLength(7);
+    expect(requests.map(maxTokensOf)).toEqual([3_000, 1_800, 4_000, 4_000, 5_000, 5_000, 2_000]);
+    const repairSystem = systemOf(requests[4]);
+    expect(repairSystem).toContain("REQUIRED REVISIONS");
+    expect(repairSystem).toContain(
+      'Section "real_time_reading" contains an unsupported quote for message 2: "We secretly moved to Paris.".',
+    );
+    expect(
+      JSON.parse(userOf(requests[4])),
+    ).toMatchObject({ evidence_issues: [expect.stringContaining("unsupported quote")] });
   });
 
   it("does not retry a timed-out request beyond the step’s bounded duration", async () => {

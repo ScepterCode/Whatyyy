@@ -454,6 +454,66 @@ function parseSection(value: unknown): ChatReport["sections"][number] | null {
   };
 }
 
+function unwrapReport(value: Record<string, unknown>): Record<string, unknown> {
+  return (getField(value, ["final_report", "report"]) as Record<string, unknown> | undefined) ?? value;
+}
+
+// Returns the first section with each requested ID, skipping IDs the part does not contain.
+function sectionsFor(value: Record<string, unknown>, ids: readonly ReportSectionId[]): unknown[] {
+  const sections = getField(unwrapReport(value), ["sections"]);
+  if (!Array.isArray(sections)) return [];
+  return ids.flatMap((id) => {
+    const match = sections.find(
+      (section) =>
+        section &&
+        typeof section === "object" &&
+        !Array.isArray(section) &&
+        getField(section as Record<string, unknown>, ["id", "section_id"]) === id,
+    );
+    return match ? [match] : [];
+  });
+}
+
+// Validates one writer half before it is accepted, so a missing, misnamed, or empty
+// section can trigger that half's format retry instead of failing the merged report.
+export function checkReportPart(
+  value: Record<string, unknown>,
+  ids: readonly ReportSectionId[],
+  requireHeader: boolean,
+): void {
+  const errors: string[] = [];
+  if (requireHeader) {
+    const source = unwrapReport(value);
+    if (!asString(getField(source, ["title"]))) errors.push("missing title");
+    if (!asString(getField(source, ["central_thesis", "thesis"]))) errors.push("missing central thesis");
+  }
+  const found = new Map(
+    sectionsFor(value, ids).map((section) => [
+      getField(section as Record<string, unknown>, ["id", "section_id"]),
+      parseSection(section),
+    ]),
+  );
+  const missing = ids.filter((id) => !found.has(id));
+  const malformed = ids.filter((id) => found.has(id) && found.get(id) === null);
+  if (missing.length) errors.push(`missing sections ${missing.join(", ")}`);
+  if (malformed.length) errors.push(`sections without a title or body: ${malformed.join(", ")}`);
+  if (errors.length) throw new ReportFormatError(errors.join("; "));
+}
+
+// Each half contributes only its own section IDs (first occurrence), so a half that
+// repeats or runs past its range cannot duplicate sections; missing ones still fail parsing.
+export function mergeReportParts(
+  opening: Record<string, unknown>,
+  closing: Record<string, unknown>,
+  openingIds: readonly ReportSectionId[],
+  closingIds: readonly ReportSectionId[],
+): Record<string, unknown> {
+  return {
+    ...unwrapReport(opening),
+    sections: [...sectionsFor(opening, openingIds), ...sectionsFor(closing, closingIds)],
+  };
+}
+
 export function parseChatReport(value: Record<string, unknown>): ChatReport {
   const source = (getField(value, ["final_report", "report"]) as Record<string, unknown> | undefined) ?? value;
   const title = asString(getField(source, ["title"]));
@@ -540,6 +600,8 @@ export function parseSafetyReview(value: Record<string, unknown>): SafetyReview 
   };
 }
 
+const EDGE_PUNCTUATION = /^[\s.,;:!?…–—-]+|[\s.,;:!?…–—-]+$/g;
+
 export function validateReportEvidence(
   report: ChatReport,
   sourceMessages: Array<{ message_id: number; sender: string; cleaned_text: string }>,
@@ -571,11 +633,16 @@ export function validateReportEvidence(
       if (!source) {
         issues.push(`Section "${section.id}" quotes unknown message ${quote.message_id}.`);
       } else if (source.sender !== quote.sender || !source.cleaned_text.includes(quote.text)) {
-        issues.push(`Section "${section.id}" contains an unsupported quote for message ${quote.message_id}.`);
+        issues.push(
+          `Section "${section.id}" contains an unsupported quote for message ${quote.message_id}: ${JSON.stringify(quote.text)}.`,
+        );
       }
     }
     for (const match of section.body.matchAll(/[“"]([^”"]{8,})[”"]/g)) {
       const quoted = match[1];
+      // Prose style often puts a comma or period inside the closing quotation mark, so only
+      // the words between any leading/trailing punctuation must appear verbatim.
+      const quotedWords = quoted.replace(EDGE_PUNCTUATION, "") || quoted;
       const precedingText = section.body
         .slice(Math.max(0, (match.index ?? 0) - 100), match.index)
         .trimEnd();
@@ -585,9 +652,11 @@ export function validateReportEvidence(
         );
       if (
         !isSuggestedScript &&
-        !sourceMessages.some((message) => message.cleaned_text.includes(quoted))
+        !sourceMessages.some((message) => message.cleaned_text.includes(quotedWords))
       ) {
-        issues.push(`Section "${section.id}" contains a quote not found verbatim in the source messages.`);
+        issues.push(
+          `Section "${section.id}" contains a quote not found verbatim in the source messages: ${JSON.stringify(quoted)}.`,
+        );
       }
     }
   }
@@ -600,8 +669,9 @@ export function validateReportEvidence(
   if (/\b(?:is|are|you(?:'re| are))\s+(?:a\s+)?(?:narcissist|borderline|sociopath|psychopath)\b/.test(combined)) {
     issues.push("The report appears to diagnose or label a person.");
   }
-  if (/\b(?:track|monitor|spy on|hack|blackmail|threaten|get revenge on)\b/.test(combined)) {
-    issues.push("The report contains potentially unsafe advice.");
+  const unsafeMatch = combined.match(/.{0,60}\b(?:track|monitor|spy on|hack|blackmail|threaten|get revenge on)\b.{0,40}/);
+  if (unsafeMatch) {
+    issues.push(`The report contains potentially unsafe advice: ${JSON.stringify(unsafeMatch[0])}.`);
   }
   const nextMoves = report.sections.find((section) => section.id === "kind_next_moves");
   if (!nextMoves || nextMoves.body.trim().length < 80) {

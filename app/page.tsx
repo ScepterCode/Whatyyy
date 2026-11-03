@@ -178,7 +178,7 @@ export default function Home() {
 
   async function analyze() {
     if (!modelConsent) {
-      setError("Confirm that you have permission to analyze this chat with the configured AI model.");
+      setError("Confirm that you have permission to analyze this chat with Google Gemini.");
       return;
     }
     setLoading(true);
@@ -452,13 +452,13 @@ export default function Home() {
                 checked={modelConsent}
                 onChange={(event) => setModelConsent(event.target.checked)}
               />
-              <span>I have permission to analyze this chat. A redacted sample is sent to the configured AI model and temporarily held by the workflow service (up to one day).</span>
+              <span>I have permission to analyze this chat. A sample of up to 180 messages, including names and message text, is sent to Google Gemini. Google may use it to improve its products, and human reviewers may read it. Don’t use a chat you wouldn’t share on those terms.</span>
             </label>
             <button className="primary-button full-button" onClick={analyze} disabled={loading}>
               {loading ? <><span className="spinner" /> <span aria-live="polite">{progress || "Reading the conversation…"}</span></> : <>Get the outside read <Icon name="arrow" size={17} /></>}
             </button>
             {error && <p className="error-message" role="alert">{error}</p>}
-            <p className="privacy-note"><Icon name="lock" size={14} /> Your original chat stays in this browser. A redacted sample is sent to the model and held by Vercel Workflows for up to one day. The report stays here or in private Blob until you delete it.</p>
+            <p className="privacy-note"><Icon name="lock" size={14} /> Your uploaded file stays in this browser, but its messages go to this app’s server, which isn’t set up to store the full chat. The server removes contact details such as phone numbers and emails, then sends a sample to Google Gemini. That sample is also held by Vercel Workflows for up to one day. The report stays here or in private Blob until you delete it.</p>
           </div>
           {history.length > 0 && (
             <section className="saved-reports" aria-labelledby="saved-reports-title">

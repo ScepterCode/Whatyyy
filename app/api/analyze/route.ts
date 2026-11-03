@@ -46,20 +46,6 @@ function sampleMessages<T>(messages: T[], limit: number): T[] {
   return [...selected].sort((a, b) => a - b).map((index) => messages[index]);
 }
 
-function isSecureModelUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      !url.username &&
-      !url.password &&
-      (url.protocol === "https:" ||
-        (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))
-    );
-  } catch {
-    return false;
-  }
-}
-
 function getSettings(
   value: Partial<ReportSettings> | undefined,
   participantCount: number,
@@ -116,9 +102,12 @@ function workflowFailureMessage(error: unknown): string {
     "The model service returned an error (",
     "The model returned an unreadable response.",
     "The model service returned an empty response.",
+    "The model declined to analyze this conversation.",
     "The model returned invalid JSON after one format retry",
+    "The model ran out of room for its reply",
     "The model did not return a complete JSON response.",
     "The independent quality review did not approve this report.",
+    "The report failed its evidence and safety checks after one repair pass.",
     "Quality review requires a safety-first note but did not provide one.",
   ];
   const match = safeMessages
@@ -135,17 +124,10 @@ function parseRequestBody(value: unknown): AnalyzeRequest | null {
 }
 
 export async function POST(request: Request) {
-  const apiUrl = process.env.MODEL_API_URL;
-  if (!apiUrl || !process.env.MODEL_API_KEY || !process.env.MODEL_NAME) {
+  if (!process.env.GEMINI_API_KEY) {
     return NextResponse.json(
-      { error: "Model access isn’t configured yet. Add MODEL_API_URL, MODEL_API_KEY, and MODEL_NAME." },
+      { error: "Model access isn’t configured yet. Add GEMINI_API_KEY." },
       { status: 503 },
-    );
-  }
-  if (!isSecureModelUrl(apiUrl)) {
-    return NextResponse.json(
-      { error: "Set MODEL_API_URL to an HTTPS endpoint. HTTP is only allowed for a local model during development." },
-      { status: 500 },
     );
   }
   const deviceKey = getDeviceKey(request);

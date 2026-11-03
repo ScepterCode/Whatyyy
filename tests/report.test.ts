@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseJsonObject, REPORT_SECTION_IDS, validateReportEvidence, type ChatReport } from "../lib/report";
+import { mergeReportParts, parseChatReport, parseJsonObject, REPORT_SECTION_IDS, validateReportEvidence, type ChatReport } from "../lib/report";
 
 function makeReport(bodyOverrides: Partial<Record<(typeof REPORT_SECTION_IDS)[number], string>>): ChatReport {
   return {
@@ -33,7 +33,33 @@ describe("validateReportEvidence", () => {
       short_version: "Sam said “We secretly moved to Paris.” Maya has not provided enough context.",
     });
     expect(validateReportEvidence(report, messages, ["Maya", "Sam"])).toContain(
-      'Section "short_version" contains a quote not found verbatim in the source messages.',
+      'Section "short_version" contains a quote not found verbatim in the source messages: "We secretly moved to Paris.".',
+    );
+  });
+
+  it("names the passage flagged as potentially unsafe advice", () => {
+    const report = makeReport({ dynamic: "You could track where Sam goes after work." });
+    expect(validateReportEvidence(report, messages, ["Maya", "Sam"])).toContain(
+      'The report contains potentially unsafe advice: "you could track where sam goes after work.".',
+    );
+  });
+
+  it("ignores leading and trailing punctuation inside body quotation marks", () => {
+    const report = makeReport({
+      short_version: "Sam answered, “We can talk tomorrow,” and Maya accepted the delay.",
+      dynamic: "Sam's reply, \"...We can talk tomorrow!\" leaves the timing open.",
+    });
+    expect(
+      validateReportEvidence(report, messages, ["Maya", "Sam"]).filter((issue) => issue.includes("quote")),
+    ).toEqual([]);
+  });
+
+  it("still rejects body quotes whose words differ from the source", () => {
+    const report = makeReport({
+      short_version: "Sam answered, “We can talk tomorrow night,” and Maya accepted the delay.",
+    });
+    expect(validateReportEvidence(report, messages, ["Maya", "Sam"])).toContain(
+      'Section "short_version" contains a quote not found verbatim in the source messages: "We can talk tomorrow night,".',
     );
   });
 });
@@ -43,5 +69,20 @@ describe("parseJsonObject", () => {
     expect(parseJsonObject('Result follows:\n```json\n{"text":"a } inside a string"}\n```')).toEqual({
       text: "a } inside a string",
     });
+  });
+});
+
+describe("mergeReportParts", () => {
+  it("keeps each half to its own section IDs so overruns cannot duplicate sections", () => {
+    const { sections, ...header } = makeReport({});
+    const openingIds = REPORT_SECTION_IDS.slice(0, 8);
+    const closingIds = REPORT_SECTION_IDS.slice(8);
+    const merged = mergeReportParts(
+      { ...header, sections },
+      { sections: [...sections.slice(0, 3), ...sections.slice(8), sections[9]] },
+      openingIds,
+      closingIds,
+    );
+    expect(parseChatReport(merged).sections.map((section) => section.id)).toEqual([...REPORT_SECTION_IDS]);
   });
 });
