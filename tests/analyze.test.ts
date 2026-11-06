@@ -1,3 +1,4 @@
+import { RetryableError } from "workflow";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GET, POST } from "../app/api/analyze/route";
 import { calculateChatStats, type ChatMessage } from "../lib/chat";
@@ -428,6 +429,31 @@ describe("analyzeConversation workflow", () => {
     expect(systemOf(requests[4])).toContain("missing sections verdict");
   });
 
+  it("names a section left empty in both attempts and tells the writer to fill every section", async () => {
+    configureModel();
+    const requests: Array<Record<string, unknown>> = [];
+    const responses = validPipelineResponses();
+    const [, closing] = reportParts() as Array<{ sections: Array<{ id: string; body: string }> }>;
+    const emptied = {
+      sections: closing.sections.map((section) =>
+        section.id === "linguistic_autopsy" ? { ...section, body: "" } : section,
+      ),
+    };
+    responses.splice(3, 2, emptied, emptied);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return modelResponse(responses.shift());
+      }),
+    );
+
+    await expect(analyzeConversation(workflowInput())).rejects.toThrow(
+      "The model's reply did not match the required format after one retry (sections without a title or body: linguistic_autopsy).",
+    );
+    expect(systemOf(requests[3])).toContain("Every requested section must have a non-empty title and body");
+  });
+
   it("reports a reply cut off at the token limit as running out of room", async () => {
     configureModel();
     const requests: Array<Record<string, unknown>> = [];
@@ -553,6 +579,29 @@ describe("analyzeConversation workflow", () => {
     expect(
       JSON.parse(userOf(requests[4])),
     ).toMatchObject({ evidence_issues: [expect.stringContaining("unsupported quote")] });
+  });
+
+  it("sends each stage's JSON schema and leaves overload errors for the workflow to retry", async () => {
+    configureModel();
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(
+          JSON.stringify({ error: { code: 503, message: "overloaded", status: "UNAVAILABLE" } }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        );
+      }),
+    );
+
+    await expect(analyzeConversation(workflowInput())).rejects.toBeInstanceOf(RetryableError);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      generationConfig: {
+        responseJsonSchema: { properties: { findings: { type: "array" } } },
+      },
+    });
   });
 
   it("does not retry a timed-out request beyond the step’s bounded duration", async () => {

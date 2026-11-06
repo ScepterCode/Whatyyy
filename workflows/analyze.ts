@@ -6,7 +6,7 @@ import {
   type GenerateContentResponse,
 } from "@google/genai";
 import { put } from "@vercel/blob";
-import { FatalError } from "workflow";
+import { FatalError, RetryableError } from "workflow";
 import {
   analystSystemPrompt,
   narrativeSystemPrompt,
@@ -15,6 +15,7 @@ import {
   WRITER_PART_SECTION_IDS,
   writerSystemPrompt,
 } from "../lib/pipeline-prompts";
+import { ANALYST_SCHEMA, NARRATIVE_SCHEMA, REVIEW_SCHEMA, writerSchema } from "../lib/pipeline-schemas";
 import {
   checkReportPart,
   mergeReportParts,
@@ -70,6 +71,7 @@ type AnalysisWorkflowResult = {
 };
 
 const MODEL_CALL_TIMEOUT_MS = 55_000;
+const MODEL_RETRY_DELAY = "15s";
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const BLOCKED_FINISH_REASONS = new Set<FinishReason>([
   FinishReason.SAFETY,
@@ -155,6 +157,7 @@ async function requestModelStep(
   systemPrompt: string,
   userData: unknown,
   maxTokens: number,
+  responseSchema: unknown,
 ): Promise<ModelReply> {
   "use step";
 
@@ -162,7 +165,7 @@ async function requestModelStep(
   if (!apiKey) {
     throw new FatalError("Model access is not configured correctly. Check the server model settings.");
   }
-  // No retryOptions: callStructuredModel owns retries, and SDK retries would overrun the step timeout.
+  // No retryOptions: the workflow retries this step, and SDK retries would overrun the step timeout.
   const client = new GoogleGenAI({ apiKey, httpOptions: { timeout: MODEL_CALL_TIMEOUT_MS } });
 
   let response: GenerateContentResponse;
@@ -174,6 +177,7 @@ async function requestModelStep(
         systemInstruction: systemPrompt,
         maxOutputTokens: maxTokens,
         responseMimeType: "application/json",
+        responseJsonSchema: responseSchema,
         // Thinking tokens count toward maxOutputTokens and add latency; each stage returns bounded JSON.
         thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
       },
@@ -183,14 +187,18 @@ async function requestModelStep(
       // Gemini reports an invalid key as a 400, not a 401.
       const keyRejected =
         error.status === 401 || error.status === 403 || /API_KEY_INVALID|API key not valid/i.test(error.message);
-      throw new FatalError(
-        keyRejected
-          ? "The model rejected the API key. Check your model settings."
-          : `The model service returned an error (${error.status}). Try again in a moment.`,
-      );
+      if (keyRejected) throw new FatalError("The model rejected the API key. Check your model settings.");
+      const message = `The model service returned an error (${error.status}). Try again in a moment.`;
+      // Overload and rate limits pass, so let the workflow retry this step after a pause.
+      if (error.status === 429 || error.status >= 500) {
+        throw new RetryableError(message, { retryAfter: MODEL_RETRY_DELAY });
+      }
+      throw new FatalError(message);
     }
     if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
-      throw new FatalError("The model took too long to complete a pipeline stage. Try again.");
+      throw new RetryableError("The model took too long to complete a pipeline stage. Try again.", {
+        retryAfter: MODEL_RETRY_DELAY,
+      });
     }
     if (error instanceof TypeError) {
       throw new FatalError("Could not reach the configured model service. Check your connection and try again.");
@@ -213,6 +221,7 @@ async function callStructuredModel(
   systemPrompt: string,
   userData: unknown,
   maxTokens: number,
+  responseSchema: unknown,
   checkShape?: (value: Record<string, unknown>) => void,
 ): Promise<Record<string, unknown>> {
   let formatProblem = "";
@@ -226,7 +235,7 @@ async function callStructuredModel(
           : `${systemPrompt}\nYour previous response was not a complete JSON object matching the requested schema (${formatProblem}). Return a complete object with every requested field and section, with no surrounding prose or markdown.`;
     // The retry gets more room, capped so one call still finishes within the step timeout.
     const tokenLimit = attempt === 0 ? maxTokens : Math.min(6_000, Math.ceil(maxTokens * 1.5));
-    const { content, truncated } = await requestModelStep(prompt, userData, tokenLimit);
+    const { content, truncated } = await requestModelStep(prompt, userData, tokenLimit, responseSchema);
     try {
       const value = parseJsonObject(content);
       checkShape?.(value);
@@ -237,7 +246,7 @@ async function callStructuredModel(
         throw new FatalError(
           truncated
             ? `The model ran out of room for its reply (${tokenLimit.toLocaleString("en-US")}-token limit) after one retry. Try again.`
-            : `The model returned invalid JSON after one format retry (${error.message}). Try again.`,
+            : `The model's reply did not match the required format after one retry (${error.message}). Try again.`,
         );
       }
       formatProblem = error.message;
@@ -326,12 +335,14 @@ async function writeReport(
     writerSystemPrompt(input.settings, 1, repairInstructions),
     writerPayload,
     maxTokens,
+    writerSchema(openingIds, true),
     (value) => checkReportPart(value, openingIds, true),
   );
   const closing = await callStructuredModel(
     writerSystemPrompt(input.settings, 2, repairInstructions),
     { ...writerPayload, report_so_far: opening },
     maxTokens,
+    writerSchema(closingIds, false),
     (value) => checkReportPart(value, closingIds, false),
   );
   return parseChatReport(mergeReportParts(opening, closing, ...WRITER_PART_SECTION_IDS));
@@ -356,6 +367,7 @@ async function reviewReport(
       },
       // Reviews list issues, scores, and repair instructions, which overran 1,200 tokens.
       2_000,
+      REVIEW_SCHEMA,
     ),
   );
 }
@@ -382,6 +394,7 @@ export async function analyzeConversation(
         analystPayload,
         // The prompt bounds findings to about 20 short entries, which fits within this cap.
         3_000,
+        ANALYST_SCHEMA,
       ),
       input.participants,
     ),
@@ -400,6 +413,7 @@ export async function analyzeConversation(
           selected_user: input.selectedUser,
         },
         1_800,
+        NARRATIVE_SCHEMA,
       ),
     ),
     input.sourceMessages,

@@ -286,12 +286,15 @@ export function parseAnalystOutput(
   const rawFindings = getField(source, ["findings"]);
   const findings = {} as Record<AnalystCategory, EvidenceFinding[]>;
   for (const category of ANALYST_CATEGORIES) {
-    const raw = getField(
-      rawFindings && typeof rawFindings === "object" && !Array.isArray(rawFindings)
-        ? (rawFindings as Record<string, unknown>)
-        : source,
-      [category],
-    );
+    // The model returns a flat list tagged by category; an object keyed by category is also accepted.
+    const raw = Array.isArray(rawFindings)
+      ? rawFindings.filter(
+          (item) => item && typeof item === "object" && (item as Record<string, unknown>).category === category,
+        )
+      : getField(
+          rawFindings && typeof rawFindings === "object" ? (rawFindings as Record<string, unknown>) : source,
+          [category],
+        );
     findings[category] = Array.isArray(raw)
       ? raw.map(parseFinding).filter((item): item is EvidenceFinding => item !== null).slice(0, 12)
       : [];
@@ -669,7 +672,10 @@ export function validateReportEvidence(
   if (/\b(?:is|are|you(?:'re| are))\s+(?:a\s+)?(?:narcissist|borderline|sociopath|psychopath)\b/.test(combined)) {
     issues.push("The report appears to diagnose or label a person.");
   }
-  const unsafeMatch = combined.match(/.{0,60}\b(?:track|monitor|spy on|hack|blackmail|threaten|get revenge on)\b.{0,40}/);
+  // "track", "monitor", and "hack" after a determiner are nouns ("neither track", "a predictable track"), not advice.
+  const unsafeMatch = combined.match(
+    /.{0,60}(?:\b(?:spy on|blackmail|threaten|get revenge on)\b|(?<!\b(?:a|an|the|this|that|one|each|either|neither|same|another|other|on|off|back)\s(?:[\w'-]+\s)?)\b(?:track|monitor|hack)\b).{0,40}/,
+  );
   if (unsafeMatch) {
     issues.push(`The report contains potentially unsafe advice: ${JSON.stringify(unsafeMatch[0])}.`);
   }

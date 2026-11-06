@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeReportParts, parseChatReport, parseJsonObject, REPORT_SECTION_IDS, validateReportEvidence, type ChatReport } from "../lib/report";
+import { mergeReportParts, parseAnalystOutput, parseChatReport, parseJsonObject, REPORT_SECTION_IDS, validateReportEvidence, type ChatReport } from "../lib/report";
 
 function makeReport(bodyOverrides: Partial<Record<(typeof REPORT_SECTION_IDS)[number], string>>): ChatReport {
   return {
@@ -44,6 +44,29 @@ describe("validateReportEvidence", () => {
     );
   });
 
+  it("does not flag track or monitor when used as a noun", () => {
+    for (const dynamic of [
+      "You retreat behind formal salutations, and neither track completely dominates.",
+      "Your communication follows a predictable track.",
+      "The two of you are back on track after the apology.",
+    ]) {
+      const issues = validateReportEvidence(makeReport({ dynamic }), messages, ["Maya", "Sam"]);
+      expect(issues.filter((issue) => issue.includes("unsafe advice"))).toEqual([]);
+    }
+  });
+
+  it("still flags surveillance advice phrased with track or monitor", () => {
+    for (const dynamic of [
+      "You should track her phone for a week.",
+      "You could monitor his messages.",
+      "Try to keep track of where Sam goes.",
+      "You can threaten to leave.",
+    ]) {
+      const issues = validateReportEvidence(makeReport({ dynamic }), messages, ["Maya", "Sam"]);
+      expect(issues.some((issue) => issue.includes("unsafe advice"))).toBe(true);
+    }
+  });
+
   it("ignores leading and trailing punctuation inside body quotation marks", () => {
     const report = makeReport({
       short_version: "Sam answered, “We can talk tomorrow,” and Maya accepted the delay.",
@@ -69,6 +92,32 @@ describe("parseJsonObject", () => {
     expect(parseJsonObject('Result follows:\n```json\n{"text":"a } inside a string"}\n```')).toEqual({
       text: "a } inside a string",
     });
+  });
+});
+
+describe("parseAnalystOutput", () => {
+  it("groups a flat findings list by its category tag", () => {
+    const finding = {
+      claim: "Sam proposes a time.",
+      supporting_messages: [{ message_id: 1, sender: "Sam", quote: "We can talk tomorrow.", timestamp: null }],
+      interpretation: "Sam may want to keep talking.",
+      confidence: "low",
+      alternative_interpretation: "Sam may just be busy today.",
+      what_would_confirm_it: "Whether the talk happens.",
+    };
+    const analysis = parseAnalystOutput(
+      {
+        participants: ["Maya", "Sam"],
+        relationship_type: "friendship",
+        relationship_stage: "unknown",
+        findings: [{ category: "repair_signals", ...finding }],
+        uncertainty_flags: [],
+        safety_flags: [],
+      },
+      ["Maya", "Sam"],
+    );
+    expect(analysis.findings.repair_signals).toHaveLength(1);
+    expect(analysis.findings.major_themes).toEqual([]);
   });
 });
 

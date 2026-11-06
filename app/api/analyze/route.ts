@@ -103,7 +103,7 @@ function workflowFailureMessage(error: unknown): string {
     "The model returned an unreadable response.",
     "The model service returned an empty response.",
     "The model declined to analyze this conversation.",
-    "The model returned invalid JSON after one format retry",
+    "The model's reply did not match the required format after one retry",
     "The model ran out of room for its reply",
     "The model did not return a complete JSON response.",
     "The independent quality review did not approve this report.",
